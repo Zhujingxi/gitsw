@@ -45,7 +45,7 @@ def rendered_history(data):
     return "".join(lines[0])
 
 
-def scenario(keys, expected_name, rows=24, cols=90, github_active="Bob", args=(), check_profiles=None, expected_text=(), followup=False):
+def scenario(keys, expected_name, rows=24, cols=90, github_active="Bob", args=(), check_profiles=None, expected_text=(), followup=False, project=False, expected_project_name=None):
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         config = root / "config/gitsw"
@@ -55,6 +55,8 @@ def scenario(keys, expected_name, rows=24, cols=90, github_active="Bob", args=()
         (config / "profiles.json").write_text(json.dumps({"profiles": profiles}))
         git = root / ".gitconfig"
         git.write_text("[user]\n name = Alice\n email = alice@example.com\n")
+        if project:
+            subprocess.run(["git", "init", "--quiet", raw], check=True)
         bin_dir = root / "bin"
         bin_dir.mkdir()
         gh = bin_dir / "gh"
@@ -149,6 +151,13 @@ sys.exit(result.returncode)
             if followup:
                 result = subprocess.run([str(BINARY), "list"], cwd=raw, env=env, capture_output=True)
                 assert result.returncode == 0, result.stderr
+            if project:
+                name_result = subprocess.run(["git", "config", "--local", "--get", "user.name"], cwd=raw, env=env, capture_output=True)
+                if expected_project_name is None:
+                    assert name_result.returncode == 1, name_result.stdout
+                else:
+                    assert name_result.returncode == 0, name_result.stderr
+                    assert name_result.stdout.decode().strip() == expected_project_name
             if check_profiles:
                 check_profiles(json.loads((config / "profiles.json").read_text()))
         finally:
@@ -161,12 +170,16 @@ sys.exit(result.returncode)
 
 scenario(b"q", "Alice")
 scenario(b"\x03", "Alice")
-scenario(b"\x1b[B\r", "Bob")
-scenario("/bob\r\r".encode(), "Bob")
+scenario([b"\x1b[B\r", b"\r"], "Bob", expected_text=("Where should Git settings apply?", "Global level", "Project level requires"))
+scenario(["/bob\r\r".encode(), b"\r"], "Bob")
 scenario(b"/nothing\r\x1bq", "Alice")
 scenario(b"\rq", "Alice", rows=8, cols=25)
 scenario(b"q", "Alice", github_active="Alice")
-print("7 inline PTY scenarios passed; colored indicators aligned, terminal restored, previous output preserved.")
+scenario([b"\x1b[B\r", b"\r"], "Alice", project=True, expected_project_name="Bob", expected_text=("Project level (this repository only)", "Switched to 工作 (project level)"))
+scenario([b"\x1b[B\r", b"j\r"], "Bob", project=True, expected_text=("Switched to 工作 (global level)",))
+scenario([b"\x1b[B\r", b"q"], "Alice", project=True, expected_text=("Cancelled.",))
+scenario(b"\x03", "Alice", project=True, args=("use", "工作"), expected_text=("Where should Git settings apply?", "Cancelled."))
+print("11 inline PTY scenarios passed; colored indicators aligned, terminal restored, previous output preserved.")
 
 
 def edited(data):

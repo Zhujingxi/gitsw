@@ -119,6 +119,18 @@ esac
             .trim()
             .into()
     }
+    fn repo(&self) -> PathBuf {
+        let repo = self.root.path().join("project");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        repo
+    }
 }
 fn success(out: Output) -> String {
     assert!(
@@ -133,7 +145,7 @@ fn success(out: Output) -> String {
 fn switches_git_gh_and_helper_preserving_unrelated_config() {
     let f = Fixture::new();
     fs::set_permissions(&f.git, fs::Permissions::from_mode(0o640)).unwrap();
-    success(f.run(&["use", "WORK"]));
+    success(f.run(&["use", "WORK", "--global"]));
     assert_eq!(f.git_value("user.name"), "Bob Example");
     assert_eq!(f.git_value("user.email"), "bob@example.com");
     assert_eq!(f.git_value("core.editor"), "vim");
@@ -158,7 +170,11 @@ fn switch_and_helper_failures_leave_git_untouched_and_restore_gh() {
     for fail in ["FAIL_SWITCH", "FAIL_SETUP"] {
         let f = Fixture::new();
         let before = fs::read(&f.git).unwrap();
-        let out = f.cmd(&["use", "work"]).env(fail, "1").output().unwrap();
+        let out = f
+            .cmd(&["use", "work", "--global"])
+            .env(fail, "1")
+            .output()
+            .unwrap();
         assert!(!out.status.success());
         assert_eq!(fs::read(&f.git).unwrap(), before);
         assert_eq!(f.active(), "Alice");
@@ -170,7 +186,7 @@ fn switch_and_helper_failures_leave_git_untouched_and_restore_gh() {
 fn concurrent_edits_are_preserved_and_gh_is_restored() {
     let f = Fixture::new();
     let out = f
-        .cmd(&["use", "work"])
+        .cmd(&["use", "work", "--global"])
         .env("CONCURRENT_EDIT", "1")
         .output()
         .unwrap();
@@ -189,7 +205,7 @@ fn token_override_blocks_switch_before_mutating_anything() {
     let f = Fixture::new();
     let before = fs::read(&f.git).unwrap();
     let out = f
-        .cmd(&["use", "work"])
+        .cmd(&["use", "work", "--global"])
         .env("GH_TOKEN", "fake-test-token")
         .output()
         .unwrap();
@@ -206,7 +222,7 @@ fn existing_git_lock_prevents_switch_and_is_left_intact() {
     let before = fs::read(&f.git).unwrap();
     let lock = f.home.join(".gitconfig.lock");
     fs::write(&lock, "other process").unwrap();
-    let out = f.run(&["use", "work"]);
+    let out = f.run(&["use", "work", "--global"]);
     assert!(!out.status.success());
     assert_eq!(fs::read(&f.git).unwrap(), before);
     assert_eq!(f.active(), "Alice");
@@ -218,7 +234,7 @@ fn existing_git_lock_prevents_switch_and_is_left_intact() {
 fn git_only_works_when_gh_is_unavailable() {
     let f = Fixture::new();
     success(
-        f.cmd(&["use", "local"])
+        f.cmd(&["use", "local", "--global"])
             .env("FAIL_DISCOVERY", "1")
             .output()
             .unwrap(),
@@ -252,7 +268,7 @@ fn preserves_symlinked_git_config() {
     let target = f.home.join("dotfiles.gitconfig");
     fs::rename(&f.git, &target).unwrap();
     symlink(&target, &f.git).unwrap();
-    success(f.run(&["use", "local"]));
+    success(f.run(&["use", "local", "--global"]));
     assert!(
         fs::symlink_metadata(&f.git)
             .unwrap()
@@ -269,7 +285,7 @@ fn global_identity_wins_over_includes_without_editing_included_file() {
     let bytes = "[user]\n name = Included User\n email = included@example.com\n";
     fs::write(&included, bytes).unwrap();
     fs::write(&f.git, "[user]\n name = Alice\n email = alice@example.com\n[include]\n path = included.gitconfig\n").unwrap();
-    success(f.run(&["use", "local"]));
+    success(f.run(&["use", "local", "--global"]));
     let out = Command::new("git")
         .args(["config", "--global", "--get", "user.name"])
         .env("GIT_CONFIG_GLOBAL", &f.git)
@@ -290,7 +306,7 @@ fn respects_xdg_global_git_config_when_home_config_is_absent() {
     )
     .unwrap();
     success(
-        f.cmd(&["use", "local"])
+        f.cmd(&["use", "local", "--global"])
             .env_remove("GIT_CONFIG_GLOBAL")
             .output()
             .unwrap(),
@@ -333,4 +349,125 @@ fn malformed_config_is_not_silently_overwritten() {
     fs::write(&path, "invalid JSON").unwrap();
     assert!(!f.run(&["list"]).status.success());
     assert_eq!(fs::read_to_string(path).unwrap(), "invalid JSON");
+}
+
+#[test]
+fn project_switch_updates_repository_identity_and_helper_only() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let global_before = fs::read(&f.git).unwrap();
+    let config = repo.join(".git/config");
+    let before = fs::read_to_string(&config).unwrap();
+    let nested = repo.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let switched = success(
+        f.cmd(&["use", "work", "--local"])
+            .current_dir(&nested)
+            .output()
+            .unwrap(),
+    );
+    assert!(switched.contains("project level"));
+    assert_eq!(fs::read(&f.git).unwrap(), global_before);
+    let saved = fs::read_to_string(&config).unwrap();
+    assert!(saved.starts_with(&before));
+    assert!(saved.contains("Bob Example"));
+    assert!(saved.contains("bob@example.com"));
+    assert!(saved.contains("gh auth git-credential"));
+    assert_eq!(f.active(), "Bob");
+    let effective = Command::new("git")
+        .args(["config", "--get", "user.name"])
+        .current_dir(&nested)
+        .env("GIT_CONFIG_GLOBAL", &f.git)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&effective.stdout).trim(),
+        "Bob Example"
+    );
+}
+
+#[test]
+fn project_switch_failure_preserves_both_configs_and_restores_gh() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let global_before = fs::read(&f.git).unwrap();
+    let config = repo.join(".git/config");
+    let project_before = fs::read(&config).unwrap();
+    let out = f
+        .cmd(&["--project", "use", "work"])
+        .current_dir(&repo)
+        .env("FAIL_SETUP", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("project Git config was not changed"));
+    assert_eq!(fs::read(&f.git).unwrap(), global_before);
+    assert_eq!(fs::read(&config).unwrap(), project_before);
+    assert_eq!(f.active(), "Alice");
+}
+
+#[test]
+fn project_scope_requires_a_repository_before_switching() {
+    let f = Fixture::new();
+    let before = fs::read(&f.git).unwrap();
+    let out = f.run(&["use", "work", "--local"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("require a Git repository"));
+    assert_eq!(fs::read(&f.git).unwrap(), before);
+    assert!(!f.root.path().join("calls").exists());
+}
+
+#[test]
+fn project_scope_resolves_linked_worktree_config() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let worktree = f.root.path().join("worktree");
+    assert!(
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "--quiet",
+                "--orphan",
+                "-b",
+                "worktree-test"
+            ])
+            .arg(&worktree)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let before = fs::read(&f.git).unwrap();
+    success(
+        f.cmd(&["use", "local", "--local"])
+            .current_dir(&worktree)
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        fs::read_to_string(repo.join(".git/config"))
+            .unwrap()
+            .contains("Local Person")
+    );
+    assert_eq!(fs::read(&f.git).unwrap(), before);
+    assert!(!worktree.join(".git/config").exists());
+}
+
+#[test]
+fn non_terminal_switch_requires_explicit_scope_and_rejects_conflicting_scopes() {
+    let f = Fixture::new();
+    let before = fs::read(&f.git).unwrap();
+    let out = f.run(&["use", "work"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("choose a scope"));
+    for args in [
+        vec!["use", "work", "--local", "--global"],
+        vec!["--local", "list"],
+        vec!["--global", "--setting"],
+    ] {
+        assert!(!f.run(&args).status.success());
+    }
+    assert_eq!(fs::read(&f.git).unwrap(), before);
+    assert!(!f.root.path().join("calls").exists());
 }

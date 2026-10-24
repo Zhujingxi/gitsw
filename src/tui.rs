@@ -1,6 +1,6 @@
 use crate::{
     config::Profile,
-    system::{Discovery, GitIdentity},
+    system::{Discovery, GitIdentity, Scope},
 };
 use anyhow::Result;
 use crossterm::{
@@ -142,6 +142,80 @@ pub(crate) fn with_terminal<T>(dialog: impl FnOnce(&mut Terminal) -> Result<T>) 
     let result = dialog(&mut terminal);
     std::panic::set_hook(old_hook);
     result
+}
+
+pub fn pick_scope(in_project: bool) -> Result<Option<Scope>> {
+    with_terminal(|terminal| {
+        let choices: &[Scope] = if in_project {
+            &[Scope::Project, Scope::Global]
+        } else {
+            &[Scope::Global]
+        };
+        let mut selection = 0;
+        let result = loop {
+            let (width, height) = terminal::size()?;
+            let mut rows = Vec::new();
+            if height < 7 || width < 20 {
+                rows.push(Row::text("Resize terminal; q quits.", Color::Yellow));
+            } else {
+                rows.push(Row::text("Where should Git settings apply?", Color::Cyan));
+                for (index, scope) in choices.iter().enumerate() {
+                    let label = match scope {
+                        Scope::Project => "Project level (this repository only)",
+                        Scope::Global => "Global level (default for all repositories)",
+                    };
+                    rows.push(Row::text(
+                        format!("{} {label}", if index == selection { ">" } else { " " }),
+                        if index == selection {
+                            Color::Cyan
+                        } else {
+                            Color::White
+                        },
+                    ));
+                }
+                if !in_project {
+                    rows.push(Row::text(
+                        "Project level requires a Git repository.",
+                        Color::Yellow,
+                    ));
+                }
+                rows.push(Row::text(
+                    "GitHub CLI's active account is shared across projects.",
+                    Color::DarkGrey,
+                ));
+                rows.push(Row::text(
+                    "↑/↓ or j/k  Enter apply  q/Esc cancel",
+                    Color::Cyan,
+                ));
+            }
+            terminal.draw(&rows, width, height)?;
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    break None;
+                }
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => break None,
+                    KeyCode::Enter if height >= 7 && width >= 20 => break Some(choices[selection]),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        selection = (selection + 1) % choices.len()
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        selection = (selection + choices.len() - 1) % choices.len()
+                    }
+                    _ => {}
+                }
+            }
+        };
+        terminal.finish(
+            result
+                .map(|scope| format!("Scope: {}", scope.label()))
+                .unwrap_or_else(|| "Cancelled.".into()),
+        )?;
+        Ok(result)
+    })
 }
 
 fn picker_loop(

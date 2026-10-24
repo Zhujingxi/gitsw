@@ -2,7 +2,7 @@
 name = "gitsw"
 version = "0.1.0"
 edition = "2024"
-description = "A terminal picker for global Git identities and GitHub CLI accounts"
+description = "A terminal picker for project and global Git identities and GitHub CLI accounts"
 license = "MIT"
 
 [dependencies]

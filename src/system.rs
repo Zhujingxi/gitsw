@@ -24,6 +24,20 @@ impl GitIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Project,
+    Global,
+}
+impl Scope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Global => "global",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GhAccount {
     pub login: String,
@@ -292,9 +306,27 @@ fn global_config_path() -> Result<PathBuf> {
             xdg_path
         }
     };
-    // Respect symlinked dotfiles by replacing their target, rather than the symlink itself.
+    resolve_config_path(path)
+}
+
+pub fn project_config_path() -> Result<Option<PathBuf>> {
+    let result = output(Command::new("git").args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "config",
+    ]))?;
+    if !result.status.success() {
+        return Ok(None);
+    }
+    let path = String::from_utf8(result.stdout)?;
+    resolve_config_path(PathBuf::from(path.trim_end_matches(['\r', '\n']))).map(Some)
+}
+
+fn resolve_config_path(path: PathBuf) -> Result<PathBuf> {
+    // Respect symlinked configs by replacing their target, rather than the symlink itself.
     if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return fs::canonicalize(&path).context("cannot resolve global Git config symlink");
+        return fs::canonicalize(&path).context("cannot resolve Git config symlink");
     }
     if path.is_absolute() {
         Ok(path)
@@ -351,7 +383,7 @@ impl Drop for GitLock {
     }
 }
 
-pub fn switch(profile: &Profile, discovery: &Discovery) -> Result<()> {
+pub fn switch(profile: &Profile, discovery: &Discovery, scope: Scope) -> Result<()> {
     profile
         .validate()
         .context("incomplete profile; configure it with `gitsw -setting`")?;
@@ -389,7 +421,11 @@ pub fn switch(profile: &Profile, discovery: &Discovery) -> Result<()> {
         None
     };
 
-    let path = global_config_path()?;
+    let path = match scope {
+        Scope::Global => global_config_path()?,
+        Scope::Project => project_config_path()?
+            .context("project-level settings require a Git repository; use --global instead")?,
+    };
     let parent = path.parent().context("Git config has no parent")?;
     fs::create_dir_all(parent)?;
     let _lock = GitLock::acquire(&path)?;
@@ -448,14 +484,17 @@ pub fn switch(profile: &Profile, discovery: &Discovery) -> Result<()> {
     };
     let result = apply().and_then(|_| {
         if read_optional(&path)? != original {
-            bail!("global Git config changed during switching; try again");
+            bail!(
+                "{} Git config changed during switching; try again",
+                scope.label()
+            );
         }
         // Git rewrites the staged path through its own lock/rename, so reopen it for fsync.
         fs::File::open(staged.path())?.sync_all()?;
         staged
             .persist(&path)
             .map_err(|e| e.error)
-            .context("cannot save global Git config")?;
+            .with_context(|| format!("cannot save {} Git config", scope.label()))?;
         Ok(())
     });
     if let Err(error) = result {
@@ -468,7 +507,10 @@ pub fn switch(profile: &Profile, discovery: &Discovery) -> Result<()> {
                 previous.user
             );
         }
-        return Err(error.context("switch cancelled; global Git config was not changed"));
+        return Err(error.context(format!(
+            "switch cancelled; {} Git config was not changed",
+            scope.label()
+        )));
     }
     Ok(())
 }
