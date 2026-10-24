@@ -7,18 +7,29 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use config::{Profile, Store};
 use std::io::{self, IsTerminal};
-use system::{Discovery, GitIdentity};
+use system::{Discovery, GitIdentity, Scope};
 
 #[derive(Parser)]
 #[command(
     version,
     about,
-    long_about = "Switch global Git name/email and the matching GitHub CLI account.\nRun without arguments to open the account picker."
+    long_about = "Switch project or global Git name/email and the matching GitHub CLI account.\nRun without arguments to open the account picker and choose the scope."
 )]
 struct Cli {
     /// Configure accounts interactively (also accepts -setting)
     #[arg(short = 's', long = "setting", visible_alias = "settings")]
     setting: bool,
+    /// Set the identity for this Git repository only
+    #[arg(
+        long,
+        visible_alias = "project",
+        global = true,
+        conflicts_with = "global"
+    )]
+    local: bool,
+    /// Set the global Git identity
+    #[arg(long, global = true)]
+    global: bool,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -47,6 +58,10 @@ fn run() -> Result<()> {
     if cli.setting && cli.command.is_some() {
         bail!("use gitsw -setting without a subcommand");
     }
+    if (cli.local || cli.global) && (cli.setting || matches!(cli.command, Some(Action::List))) {
+        bail!("--local and --global apply only when switching identities");
+    }
+    let terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
     if cli.command.is_none() && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
         let menu = if cli.setting {
             "settings menu"
@@ -74,21 +89,46 @@ fn run() -> Result<()> {
     if store.profiles.is_empty() {
         bail!("no identities found. Use `gitsw -setting` or `gh auth login`");
     }
+    if !terminal && !cli.local && !cli.global {
+        bail!(
+            "choose a scope with `gitsw use LABEL --local` or `gitsw use LABEL --global`; the scope prompt needs a terminal"
+        );
+    }
+    if cli.local && system::project_config_path()?.is_none() {
+        bail!("project-level settings require a Git repository; use --global instead");
+    }
+    let picker_current = if cli.global {
+        current
+    } else {
+        system::effective_identity()?
+    };
     let selection = match cli.command {
         Some(Action::Use { label }) => Some(
             store
                 .find(&label)
                 .with_context(|| format!("unknown profile {label:?}; run `gitsw list`"))?,
         ),
-        None => tui::pick(&store.profiles, &current, &discovery)?,
+        None => tui::pick(&store.profiles, &picker_current, &discovery)?,
         _ => unreachable!(),
     };
     if let Some(index) = selection {
         let profile = &store.profiles[index];
-        system::switch(profile, &discovery)?;
+        let scope = if cli.local {
+            Scope::Project
+        } else if cli.global {
+            Scope::Global
+        } else if let Some(scope) = tui::pick_scope(system::project_config_path()?.is_some())? {
+            scope
+        } else {
+            return Ok(());
+        };
+        system::switch(profile, &discovery, scope)?;
         println!(
-            "Switched to {}\n  Git: {} <{}>",
-            profile.label, profile.name, profile.email
+            "Switched to {} ({} level)\n  Git: {} <{}>",
+            profile.label,
+            scope.label(),
+            profile.name,
+            profile.email
         );
         if let Some(gh) = &profile.github {
             println!(
@@ -100,7 +140,10 @@ fn run() -> Result<()> {
         if effective.name.as_deref() != Some(&profile.name)
             || effective.email.as_deref() != Some(&profile.email)
         {
-            println!("Note: this repository or an included config overrides the global identity.");
+            println!(
+                "Note: this repository or an included config overrides the {} identity.",
+                scope.label()
+            );
         }
         for key in [
             "GIT_AUTHOR_NAME",
